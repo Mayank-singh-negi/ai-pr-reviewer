@@ -7,6 +7,6 @@ anyio>=4.8.0
 mcp==1.27.2
 chromadb==1.5.9
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=1.11.0
+torch==2.2.0+cpu
 sentence-transformers==2.5.1
 openai>=1.0.0
