@@ -1,14 +1,20 @@
 import re
+import logging
 from typing import Any, Dict, List
 
 from github.GithubException import GithubException
 
 from rag.indexer import index_repository, query_similar_code
 from utils.github_helper import fetch_pull_request, fetch_pull_request_diff
+from memory.feedback_memory import should_skip_suggestion
+
+# Configure logging for the pipeline module.
+logger = logging.getLogger(__name__)
 
 
 def extract_changed_files_from_pr(pr) -> List[Dict[str, str]]:
     """Extract changed files and patch text from a GitHub pull request."""
+    logger.debug(f"Extracting changed files from PR")
     changed_files = []
     for changed_file in pr.get_files():
         changed_files.append(
@@ -17,13 +23,17 @@ def extract_changed_files_from_pr(pr) -> List[Dict[str, str]]:
                 "patch": changed_file.patch or "",
             }
         )
+    logger.info(f"Extracted {len(changed_files)} changed files")
     return changed_files
 
 
 def build_rag_context(repo_name: str, pr_number: int, n_results: int = 5) -> Dict[str, Any]:
     """Query ChromaDB for similar code examples for changed PR files."""
+    logger.info(f"Building RAG context for {repo_name}#{pr_number}")
+    
     index_response = index_repository(repo_name)
     if index_response.get("status") not in {"indexed", "skipped"}:
+        logger.error(f"Failed to index repository: {index_response.get('error')}")
         return {
             "repo_name": repo_name,
             "error": index_response.get("error", "Failed to index repository."),
@@ -45,14 +55,16 @@ def build_rag_context(repo_name: str, pr_number: int, n_results: int = 5) -> Dic
             "similar_code": query_response.get("results", []),
         }
         rag_results["files"].append(file_context)
+        logger.debug(f"RAG query for {changed_file['filename']}: {len(query_response.get('results', []))} results")
 
+    logger.info(f"RAG context built with {len(rag_results['files'])} files")
     return rag_results
 
 
 def summarize_rag_context(rag_context: Dict[str, Any]) -> str:
     """Create a short summary of retrieved RAG context for inclusion in prompts."""
-    summary_lines = [f"RAG context for repo {rag_context.get('repo_name')}:"
-                    ]
+    summary_lines = [f"RAG context for repo {rag_context.get('repo_name')}:"]
+    
     for file_entry in rag_context.get("files", []):
         source = file_entry["filename"]
         similar = file_entry.get("similar_code", [])
@@ -66,6 +78,7 @@ def summarize_rag_context(rag_context: Dict[str, Any]) -> str:
             summary_lines.append(
                 f"  * {metadata.get('file_path')} lines {metadata.get('start_line')}-{metadata.get('end_line')}"
             )
+    
     return "\n".join(summary_lines)
 
 
@@ -78,6 +91,7 @@ def build_review_prompt(
     rag_summary: str,
 ) -> str:
     """Assemble the review prompt to send to Claude with RAG context included."""
+    logger.debug(f"Building review prompt for {repo_name}#{pr_number}")
     return (
         "You are an expert code reviewer.\n"
         f"Repository: {repo_name}\n"
@@ -93,11 +107,34 @@ def build_review_prompt(
     )
 
 
+def filter_suggestions_by_memory(suggestions: List[Dict[str, Any]], repo_name: str, file_path: str) -> List[Dict[str, Any]]:
+    """Filter out suggestions that have been frequently dismissed in the past.
+    
+    Checks memory before posting a suggestion — skips if pattern is often ignored.
+    """
+    logger.info(f"Filtering suggestions for {file_path} using memory")
+    filtered = []
+    
+    for suggestion in suggestions:
+        suggestion_type = suggestion.get("type", "general")
+        
+        # Check if this suggestion pattern should be skipped based on feedback memory.
+        if should_skip_suggestion(suggestion_type, file_path):
+            logger.info(f"Skipping suggestion (type={suggestion_type}, file={file_path}) — frequently dismissed")
+            continue
+        
+        filtered.append(suggestion)
+    
+    logger.info(f"Kept {len(filtered)}/{len(suggestions)} suggestions after memory filtering")
+    return filtered
+
+
 def call_claude_review(prompt: str) -> str:
     """Placeholder for the Claude call used in the review node.
 
     Replace this function with the actual Anthropic/Claude integration in Phase 5.
     """
+    logger.info("Calling Claude review endpoint (placeholder)")
     # TODO: Replace this stub with an actual call to Claude API
     return (
         "[Claude review placeholder]\n" "The review prompt was built successfully, and RAG context was included."
@@ -106,8 +143,11 @@ def call_claude_review(prompt: str) -> str:
 
 def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
     """Execute the review pipeline with RAG context for a pull request."""
+    logger.info(f"Starting review pipeline for {repo_name}#{pr_number}")
+    
     pr = fetch_pull_request(repo_name, pr_number)
     full_diff = fetch_pull_request_diff(pr)
+    logger.debug(f"PR diff fetched: {len(full_diff)} characters")
 
     rag_context = build_rag_context(repo_name, pr_number)
     rag_summary = summarize_rag_context(rag_context)
@@ -122,6 +162,7 @@ def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
     )
 
     review_text = call_claude_review(prompt)
+    logger.info(f"Review completed for {repo_name}#{pr_number}")
 
     return {
         "repo_name": repo_name,
@@ -134,8 +175,10 @@ def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
 
 def get_changed_filenames_from_diff(diff: str) -> List[str]:
     """Parse a diff string and return a list of changed filenames."""
+    logger.debug("Parsing filenames from diff")
     filenames = []
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             filenames.append(line.replace("+++ b/", ""))
+    logger.debug(f"Found {len(filenames)} changed files in diff")
     return filenames

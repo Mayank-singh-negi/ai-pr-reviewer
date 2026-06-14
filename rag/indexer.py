@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from github import Github
@@ -8,6 +9,9 @@ from github.GithubException import GithubException
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+
+# Configure logging for the RAG indexer module.
+logger = logging.getLogger(__name__)
 
 # The directory where ChromaDB will persist its local database files.
 PERSIST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chroma_db")
@@ -29,12 +33,14 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 def _get_embedding_model() -> SentenceTransformer:
     """Load the sentence-transformers model used for code embeddings."""
+    logger.debug(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
 def _get_chroma_client() -> chromadb.Client:
     """Create a persistent ChromaDB client for the local index."""
     os.makedirs(PERSIST_DIR, exist_ok=True)
+    logger.debug(f"Creating ChromaDB client with persist_dir: {PERSIST_DIR}")
     settings = Settings(
         chroma_db_impl="duckdb+parquet",
         persist_directory=PERSIST_DIR,
@@ -71,6 +77,7 @@ def _split_code_into_chunks(code: str, file_path: str) -> List[Dict[str, Any]]:
     """Split a source file into logical chunks by functions and classes."""
     language = _language_for_path(file_path)
     lines = code.splitlines()
+    logger.debug(f"Splitting {file_path} ({language}) into chunks: {len(lines)} lines")
 
     if language == "python":
         pattern = re.compile(r"^(async\s+def|def|class)\s+\w+")
@@ -124,13 +131,17 @@ def _split_code_into_chunks(code: str, file_path: str) -> List[Dict[str, Any]]:
             }
         ]
 
+    logger.debug(f"Created {len(chunks)} chunks for {file_path}")
     return chunks
 
 
 def _fetch_code_files(repo_name: str) -> List[Tuple[str, str]]:
     """Fetch repository files recursively from GitHub using PyGithub."""
+    logger.info(f"Fetching code files from repository: {repo_name}")
+    
     github_token = os.getenv("GITHUB_TOKEN")
     if not github_token:
+        logger.error("GITHUB_TOKEN is not set")
         raise RuntimeError("GITHUB_TOKEN is required to index a repository.")
 
     client = Github(github_token)
@@ -152,16 +163,20 @@ def _fetch_code_files(repo_name: str) -> List[Tuple[str, str]]:
             code = item.decoded_content.decode("utf-8", errors="replace")
             files.append((item.path, code))
 
+    logger.info(f"Fetched {len(files)} code files from {repo_name}")
     return files
 
 
 def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
     """Index repository source files into ChromaDB by logical code chunks."""
+    logger.info(f"Indexing repository: {repo_name} (force={force})")
+    
     collection_name = _sanitize_collection_name(repo_name)
     client = _get_chroma_client()
 
     existing_collections = [collection.name for collection in client.list_collections()]
     if collection_name in existing_collections and not force:
+        logger.info(f"Repository {repo_name} already indexed, skipping")
         return {
             "repo_name": repo_name,
             "collection_name": collection_name,
@@ -170,6 +185,7 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
         }
 
     if collection_name in existing_collections and force:
+        logger.info(f"Force reindexing: deleting existing collection {collection_name}")
         client.delete_collection(name=collection_name)
 
     collection = client.create_collection(name=collection_name)
@@ -178,8 +194,10 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
     try:
         files = _fetch_code_files(repo_name)
     except GithubException as exc:
+        logger.error(f"GitHub API error while indexing {repo_name}: {exc}")
         return {"error": f"GitHub API error while indexing repository: {exc}"}
     except Exception as exc:
+        logger.error(f"Unexpected error while indexing {repo_name}: {exc}")
         return {"error": f"Unexpected error while indexing repository: {exc}"}
 
     ids = []
@@ -213,6 +231,7 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
             documents=documents,
             embeddings=embeddings,
         )
+        logger.info(f"Indexed {len(ids)} code chunks for {repo_name}")
 
     return {
         "repo_name": repo_name,
@@ -234,18 +253,23 @@ def query_similar_code(
         n_results: Number of similar results to return.
         repo_name: Repository name whose index should be searched.
     """
+    logger.info(f"Querying similar code for {repo_name} (n_results={n_results})")
+    
     if not code_snippet.strip():
+        logger.warning("Empty code snippet provided")
         return {"results": []}
 
     client = _get_chroma_client()
     if repo_name:
         collection_name = _sanitize_collection_name(repo_name)
     else:
+        logger.error("repo_name is required to query the index")
         return {"error": "repo_name is required to query the index."}
 
     try:
         collection = client.get_collection(name=collection_name)
-    except Exception:
+    except Exception as exc:
+        logger.error(f"Collection not found for {repo_name}: {exc}")
         return {"error": f"No index found for repository '{repo_name}'."}
 
     embedder = _get_embedding_model()
@@ -268,16 +292,20 @@ def query_similar_code(
             }
         )
 
+    logger.info(f"Query returned {len(results)} similar code results")
     return {"repo_name": repo_name, "results": results}
 
 
 def clear_index(repo_name: str) -> Dict[str, Any]:
     """Remove an existing ChromaDB index for a repository."""
+    logger.info(f"Clearing index for repository: {repo_name}")
+    
     collection_name = _sanitize_collection_name(repo_name)
     client = _get_chroma_client()
     existing_collections = [collection.name for collection in client.list_collections()]
 
     if collection_name not in existing_collections:
+        logger.warning(f"No index found to clear for {repo_name}")
         return {
             "repo_name": repo_name,
             "status": "missing",
@@ -285,6 +313,7 @@ def clear_index(repo_name: str) -> Dict[str, Any]:
         }
 
     client.delete_collection(name=collection_name)
+    logger.info(f"Cleared index for {repo_name}")
     return {
         "repo_name": repo_name,
         "status": "cleared",
