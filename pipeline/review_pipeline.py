@@ -1,5 +1,7 @@
 import re
+import os
 import logging
+import openai
 from typing import Any, Dict, List
 
 from github.GithubException import GithubException
@@ -10,6 +12,14 @@ from memory.feedback_memory import should_skip_suggestion
 
 # Configure logging for the pipeline module.
 logger = logging.getLogger(__name__)
+
+# Initialize OpenAI API key (optional). If not set, the placeholder is used.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+    logger.info("OpenAI API key loaded for review pipeline")
+else:
+    logger.info("OPENAI_API_KEY not set — pipeline will use placeholder reviews")
 
 
 def extract_changed_files_from_pr(pr) -> List[Dict[str, str]]:
@@ -130,15 +140,41 @@ def filter_suggestions_by_memory(suggestions: List[Dict[str, Any]], repo_name: s
 
 
 def call_claude_review(prompt: str) -> str:
-    """Placeholder for the Claude call used in the review node.
+    """Use OpenAI ChatCompletion as the review engine when `OPENAI_API_KEY` is set.
 
-    Replace this function with the actual Anthropic/Claude integration in Phase 5.
+    This keeps the function name (`call_claude_review`) so the rest of the
+    pipeline does not need to be changed. If `OPENAI_API_KEY` is missing, a
+    readable placeholder string is returned.
     """
-    logger.info("Calling Claude review endpoint (placeholder)")
-    # TODO: Replace this stub with an actual call to Claude API
-    return (
-        "[Claude review placeholder]\n" "The review prompt was built successfully, and RAG context was included."
-    )
+    logger.info("Invoking review model for prompt (length=%d)", len(prompt))
+
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY not configured — returning placeholder review")
+        return (
+            "[OpenAI placeholder review]\n"
+            "OpenAI API key not configured. Set OPENAI_API_KEY to enable real reviews."
+        )
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert code reviewer."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1500,
+            temperature=0.0,
+        )
+        review_text = response.choices[0].message.content
+        logger.info("OpenAI review received (tokens=%s)", getattr(response, 'usage', {}))
+        return review_text
+    except Exception as exc:
+        logger.error(f"OpenAI review call failed: {exc}")
+        return (
+            "[OpenAI review error]\n"
+            f"OpenAI call failed: {exc}\n"
+            "Falling back to placeholder summary."
+        )
 
 
 def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
