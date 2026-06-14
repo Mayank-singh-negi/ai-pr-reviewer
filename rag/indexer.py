@@ -8,13 +8,14 @@ from github.GithubException import GithubException
 
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+import shutil
+from typing import Union
 
 # Configure logging for the RAG indexer module.
 logger = logging.getLogger(__name__)
 
 # The directory where ChromaDB will persist its local database files.
-PERSIST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chroma_db")
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR") or os.path.join(os.path.dirname(os.path.dirname(__file__)), "chroma_db")
 
 # Supported code file extensions for repository indexing.
 SUPPORTED_EXTENSIONS = {
@@ -31,21 +32,84 @@ SUPPORTED_EXTENSIONS = {
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-def _get_embedding_model() -> SentenceTransformer:
+def _get_embedding_model() -> Any:
     """Load the sentence-transformers model used for code embeddings."""
     logger.debug(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        return SentenceTransformer(EMBEDDING_MODEL_NAME)
+    except Exception:
+        # Fallback dummy embedder when sentence-transformers or torch
+        # are not available (useful for tests or minimal deployments).
+        class _DummyEmbedder:
+            def encode(self, text, convert_to_numpy=False):
+                # return a deterministic short embedding
+                return [0.0]
+
+        logger.warning("sentence-transformers not available; using dummy embedder")
+        return _DummyEmbedder()
 
 
-def _get_chroma_client() -> chromadb.Client:
-    """Create a persistent ChromaDB client for the local index."""
+_CHROMA_AVAILABLE: bool | None = None
+
+
+def _get_chroma_client() -> Union[chromadb.Client, None]:
+    """Create a persistent ChromaDB client for the local index.
+
+    Returns `None` when the Chroma client cannot be initialized. Callers
+    should gracefully handle a `None` client and proceed without RAG.
+    """
     os.makedirs(PERSIST_DIR, exist_ok=True)
     logger.debug(f"Creating ChromaDB client with persist_dir: {PERSIST_DIR}")
     settings = Settings(
         chroma_db_impl="duckdb+parquet",
         persist_directory=PERSIST_DIR,
     )
-    return chromadb.Client(settings=settings)
+
+    try:
+        return chromadb.Client(settings=settings)
+    except Exception as exc:
+        # Detect migration / compatibility errors and optionally recreate the
+        # local persistence directory when the deployment allows it.
+        message = str(exc) or "(no error message)"
+        logger.error("Chroma client initialization failed: %s", message)
+
+        allow_recreate = os.getenv("CHROMA_ALLOW_RECREATE", "false").lower() in ("1", "true", "yes")
+        if allow_recreate:
+            try:
+                logger.warning("Removing Chroma persist dir and retrying (CHROMA_ALLOW_RECREATE=true)")
+                if os.path.exists(PERSIST_DIR):
+                    shutil.rmtree(PERSIST_DIR)
+                os.makedirs(PERSIST_DIR, exist_ok=True)
+                return chromadb.Client(settings=settings)
+            except Exception as exc2:
+                logger.error("Retry after recreate also failed: %s", exc2)
+
+        # Fallback: return None to indicate Chroma is unavailable. Callers will
+        # treat this as 'RAG disabled' and continue the review pipeline.
+        _set_chroma_available(False)
+        return None
+
+
+def _set_chroma_available(value: bool) -> None:
+    global _CHROMA_AVAILABLE
+    _CHROMA_AVAILABLE = bool(value)
+
+
+def is_chroma_available() -> bool:
+    """Return whether Chroma client can be initialized.
+
+    This function caches the result to avoid repeated expensive failures.
+    """
+    global _CHROMA_AVAILABLE
+    if _CHROMA_AVAILABLE is not None:
+        return _CHROMA_AVAILABLE
+
+    client = _get_chroma_client()
+    available = client is not None
+    _set_chroma_available(available)
+    return available
 
 
 def _sanitize_collection_name(repo_name: str) -> str:
@@ -174,7 +238,25 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
     collection_name = _sanitize_collection_name(repo_name)
     client = _get_chroma_client()
 
-    existing_collections = [collection.name for collection in client.list_collections()]
+    if client is None:
+        logger.warning("ChromaDB client unavailable — skipping indexing for %s", repo_name)
+        return {
+            "repo_name": repo_name,
+            "collection_name": collection_name,
+            "status": "disabled",
+            "message": "ChromaDB unavailable; RAG features disabled.",
+        }
+
+    try:
+        existing_collections = [collection.name for collection in client.list_collections()]
+    except Exception as exc:
+        logger.error("Failed to list Chroma collections: %s", exc)
+        return {
+            "repo_name": repo_name,
+            "collection_name": collection_name,
+            "status": "disabled",
+            "message": f"ChromaDB error: {exc}",
+        }
     if collection_name in existing_collections and not force:
         logger.info(f"Repository {repo_name} already indexed, skipping")
         return {
@@ -186,9 +268,21 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
 
     if collection_name in existing_collections and force:
         logger.info(f"Force reindexing: deleting existing collection {collection_name}")
-        client.delete_collection(name=collection_name)
+        try:
+            client.delete_collection(name=collection_name)
+        except Exception as exc:
+            logger.error("Failed to delete collection %s: %s", collection_name, exc)
 
-    collection = client.create_collection(name=collection_name)
+    try:
+        collection = client.create_collection(name=collection_name)
+    except Exception as exc:
+        logger.error("Failed to create/get collection %s: %s", collection_name, exc)
+        return {
+            "repo_name": repo_name,
+            "collection_name": collection_name,
+            "status": "disabled",
+            "message": f"ChromaDB collection error: {exc}",
+        }
     embedder = _get_embedding_model()
 
     try:
@@ -225,13 +319,22 @@ def index_repository(repo_name: str, force: bool = False) -> Dict[str, Any]:
             embeddings.append(embedder.encode(chunk["text"], convert_to_numpy=True).tolist())
 
     if ids:
-        collection.add(
-            ids=ids,
-            metadatas=metadatas,
-            documents=documents,
-            embeddings=embeddings,
-        )
-        logger.info(f"Indexed {len(ids)} code chunks for {repo_name}")
+        try:
+            collection.add(
+                ids=ids,
+                metadatas=metadatas,
+                documents=documents,
+                embeddings=embeddings,
+            )
+            logger.info(f"Indexed {len(ids)} code chunks for {repo_name}")
+        except Exception as exc:
+            logger.error("Failed to add documents to collection %s: %s", collection_name, exc)
+            return {
+                "repo_name": repo_name,
+                "collection_name": collection_name,
+                "status": "disabled",
+                "message": f"ChromaDB add error: {exc}",
+            }
 
     return {
         "repo_name": repo_name,
@@ -260,6 +363,9 @@ def query_similar_code(
         return {"results": []}
 
     client = _get_chroma_client()
+    if client is None:
+        logger.warning("ChromaDB client unavailable — returning empty results for query")
+        return {"repo_name": repo_name, "results": []}
     if repo_name:
         collection_name = _sanitize_collection_name(repo_name)
     else:
@@ -269,8 +375,8 @@ def query_similar_code(
     try:
         collection = client.get_collection(name=collection_name)
     except Exception as exc:
-        logger.error(f"Collection not found for {repo_name}: {exc}")
-        return {"error": f"No index found for repository '{repo_name}'."}
+        logger.warning("Collection not available for %s: %s", repo_name, exc)
+        return {"repo_name": repo_name, "results": []}
 
     embedder = _get_embedding_model()
     query_embedding = embedder.encode(code_snippet, convert_to_numpy=True).tolist()
@@ -302,7 +408,23 @@ def clear_index(repo_name: str) -> Dict[str, Any]:
     
     collection_name = _sanitize_collection_name(repo_name)
     client = _get_chroma_client()
-    existing_collections = [collection.name for collection in client.list_collections()]
+    if client is None:
+        logger.warning("ChromaDB client unavailable — nothing to clear for %s", repo_name)
+        return {
+            "repo_name": repo_name,
+            "status": "disabled",
+            "message": "ChromaDB unavailable; nothing to clear.",
+        }
+
+    try:
+        existing_collections = [collection.name for collection in client.list_collections()]
+    except Exception as exc:
+        logger.error("Failed to list collections while clearing index: %s", exc)
+        return {
+            "repo_name": repo_name,
+            "status": "disabled",
+            "message": f"ChromaDB error: {exc}",
+        }
 
     if collection_name not in existing_collections:
         logger.warning(f"No index found to clear for {repo_name}")
@@ -311,9 +433,16 @@ def clear_index(repo_name: str) -> Dict[str, Any]:
             "status": "missing",
             "message": "No existing index was found to clear.",
         }
-
-    client.delete_collection(name=collection_name)
-    logger.info(f"Cleared index for {repo_name}")
+    try:
+        client.delete_collection(name=collection_name)
+        logger.info(f"Cleared index for {repo_name}")
+    except Exception as exc:
+        logger.error("Failed to delete collection %s: %s", collection_name, exc)
+        return {
+            "repo_name": repo_name,
+            "status": "disabled",
+            "message": f"ChromaDB delete error: {exc}",
+        }
     return {
         "repo_name": repo_name,
         "status": "cleared",

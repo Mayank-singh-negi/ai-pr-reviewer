@@ -131,3 +131,73 @@ For issues:
 - Check Railway docs: https://docs.railway.app
 - Check Google Gemini docs: https://developers.generativeai.google
 - Review GitHub webhook docs: https://docs.github.com/webhooks
+
+
+## ChromaDB compatibility and recovery
+
+If you see runtime errors mentioning "migrate your data to the new Chroma architecture" or failures creating a Chroma client,
+there are two safe options depending on whether your stored vector data is critical:
+
+- Quick recreate (data non-critical):
+  - Set the environment variable `CHROMA_ALLOW_RECREATE=true` in Railway or your `.env` file. The service will attempt
+    to remove and recreate the local `chroma_db/` persistence directory when the Chroma client fails to initialize.
+  - This ensures the service becomes available immediately but will discard existing vector data.
+
+- Preserve and migrate (data critical):
+  - Install the Chroma migration tool locally on an admin machine:
+
+```bash
+pip install chroma-migrate
+```
+
+  - Follow the migration tool instructions printed by the Chroma error logs, or run the migration command suggested by the tool.
+  - After migration, redeploy the service.
+
+Notes:
+- By default the service will not auto-delete your Chroma persistence. `CHROMA_ALLOW_RECREATE` is opt-in.
+- For production scaling, consider using an external managed vector DB instead of local filesystem persistence.
+
+### Railway environment setup (CLI)
+
+You can set environment variables on Railway using the CLI:
+
+```bash
+railway login
+railway variables set GITHUB_TOKEN=ghp_xxx --project <project_id>
+railway variables set GITHUB_WEBHOOK_SECRET=your_secret --project <project_id>
+railway variables set GEMINI_API_KEY=your_key --project <project_id>
+railway variables set CHROMA_ALLOW_RECREATE=true --project <project_id>
+railway variables set SENTRY_DSN=your_sentry_dsn --project <project_id>
+```
+
+Replace `<project_id>` with your Railway project identifier (or omit `--project` to set for the current project).
+
+### Backing up local Chroma data
+
+Before running migrations or recreation, create a backup copy of `chroma_db/`:
+
+```bash
+python scripts/backup_chroma.py
+```
+
+The script creates a timestamped `.zip` file under `backups/`.
+
+## Local smoke test
+
+After deploying or running locally, verify the service with the included smoke test:
+
+1. Copy `.env.example` to `.env` and fill in `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, and `GEMINI_API_KEY`.
+2. Start the app:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+3. Run the smoke test (from repository root):
+
+```bash
+python -m tests.smoke_test
+```
+
+The smoke test will check `/health`, `/stats`, and post a synthetic, signed `/webhook` event.
+

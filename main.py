@@ -8,8 +8,12 @@ from typing import Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from dotenv import load_dotenv
+try:
+    import sentry_sdk  # optional
+except Exception:
+    sentry_sdk = None
 
-from pipeline.review_pipeline import run_review_pipeline
+from pipeline.review_pipeline import run_review_pipeline, call_gemini_review, build_review_prompt
 from utils.github_helper import (
     fetch_pull_request,
     fetch_pull_request_diff,
@@ -137,10 +141,20 @@ async def health() -> Dict[str, Any]:
     """Health check endpoint for deployment monitoring."""
     uptime = time.time() - START_TIME
     logger.info("Health check requested.")
+    chroma_status = False
+    try:
+        # lazy import to avoid import cycles
+        from rag.indexer import is_chroma_available
+
+        chroma_status = bool(is_chroma_available())
+    except Exception:
+        chroma_status = False
+
     return {
         "status": "healthy",
         "version": "1.0.0",
         "uptime_seconds": round(uptime, 2),
+        "chroma_available": chroma_status,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -276,17 +290,34 @@ async def webhook(
     # Run the AI review pipeline and post the summary back to GitHub.
     try:
         review_result = run_review_pipeline(repo_full_name, pr_number)
-        review_text = review_result.get("review_text", "").strip()
-        tokens_used = int(review_result.get("tokens_used", 0) or 0)
+    except Exception as exc:
+        logger.error("RAG or pipeline failure for %s#%s: %s — attempting fallback", repo_full_name, pr_number, exc)
+        # Attempt a fallback Gemini-only review using the diff and minimal context.
+        try:
+            fallback_prompt = build_review_prompt(
+                repo_name=repo_full_name,
+                pr_number=pr_number,
+                pr_title=pr_title,
+                pr_body=pr_body or "",
+                full_diff=full_diff,
+                rag_summary="(RAG context unavailable)",
+            )
+            review_result = call_gemini_review(fallback_prompt)
+        except Exception as exc2:
+            logger.error("Fallback Gemini review also failed: %s", exc2)
+            review_result = {"review_text": "[AI review unavailable]", "tokens_used": 0}
 
-        if not review_text:
-            logger.warning("Gemini generated an empty review for %s#%s", repo_full_name, pr_number)
-            raise RuntimeError("Gemini returned an empty review response.")
+    review_text = review_result.get("review_text", "").strip()
+    tokens_used = int(review_result.get("tokens_used", 0) or 0)
 
-        post_result = post_pr_summary(repo_full_name, pr_number, review_text)
-        if post_result.get("error"):
-            raise RuntimeError(post_result["error"])
+    if not review_text:
+        logger.warning("Final review text empty for %s#%s — posting placeholder", repo_full_name, pr_number)
+        review_text = "[AI review generated no content]"
 
+    post_result = post_pr_summary(repo_full_name, pr_number, review_text)
+    if post_result.get("error"):
+        logger.error("Failed to post review comment for %s#%s: %s", repo_full_name, pr_number, post_result.get("error"))
+    else:
         logger.info(
             "Review comment posted for %s#%s: %s",
             repo_full_name,
@@ -294,14 +325,6 @@ async def webhook(
             post_result.get("comment_url"),
         )
         _record_pr_review(tokens_used=tokens_used, comments_posted=1)
-    except Exception as exc:
-        logger.error(
-            "Failed to complete AI review for %s#%s: %s",
-            repo_full_name,
-            pr_number,
-            exc,
-        )
-        raise HTTPException(status_code=500, detail=f"AI review failed: {exc}")
 
     return PlainTextResponse("Pull request review generated and posted.", status_code=200)
 
@@ -316,6 +339,14 @@ async def startup() -> None:
     logger.info(f"Stats file initialized at {STATS_FILE}")
     logger.info(f"Memory directory: {MEMORY_DIR}")
     logger.info(f"ChromaDB directory: {CHROMA_DB_DIR}")
+    # Initialize Sentry if configured (optional)
+    sentry_dsn = os.getenv("SENTRY_DSN")
+    if sentry_dsn and sentry_sdk:
+        try:
+            sentry_sdk.init(dsn=sentry_dsn, release="ai-pr-reviewer@1.0.0")
+            logger.info("Sentry initialized")
+        except Exception as exc:
+            logger.warning("Failed to initialize Sentry: %s", exc)
     logger.info("=" * 60)
 
 

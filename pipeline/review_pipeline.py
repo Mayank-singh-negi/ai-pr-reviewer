@@ -35,8 +35,9 @@ def build_rag_context(repo_name: str, pr_number: int, n_results: int = 5) -> Dic
     logger.info(f"Building RAG context for {repo_name}#{pr_number}")
     
     index_response = index_repository(repo_name)
-    if index_response.get("status") not in {"indexed", "skipped"}:
-        logger.error(f"Failed to index repository: {index_response.get('error')}")
+    # Treat Chroma being disabled as non-fatal — continue with empty RAG context.
+    if index_response.get("status") not in {"indexed", "skipped", "disabled"}:
+        logger.error("Failed to index repository: %s", index_response.get("error"))
         return {
             "repo_name": repo_name,
             "error": index_response.get("error", "Failed to index repository."),
@@ -51,7 +52,11 @@ def build_rag_context(repo_name: str, pr_number: int, n_results: int = 5) -> Dic
         if not snippet:
             snippet = f"Changes in {changed_file['filename']}"
 
-        query_response = query_similar_code(snippet, n_results=n_results, repo_name=repo_name)
+        try:
+            query_response = query_similar_code(snippet, n_results=n_results, repo_name=repo_name)
+        except Exception as exc:
+            logger.warning("RAG query failed for %s: %s — continuing without RAG results", changed_file["filename"], exc)
+            query_response = {"results": []}
         file_context = {
             "filename": changed_file["filename"],
             "patch": changed_file["patch"],
