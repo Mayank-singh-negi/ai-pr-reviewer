@@ -62,6 +62,8 @@ cd ai-pr-reviewer
 pip install -r requirements.txt
 ```
 
+This project uses `google-genai==2.8.0` for Google Gemini integration.
+
 3. Set up environment variables
 ```bash
 cp .env.example .env

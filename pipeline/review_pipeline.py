@@ -1,6 +1,6 @@
 import os
 import logging
-import google.generativeai as genai
+import google.genai as genai
 from typing import Any, Dict, List
 
 from rag.indexer import index_repository, query_similar_code
@@ -10,12 +10,8 @@ from memory.feedback_memory import should_skip_suggestion
 # Configure logging for the pipeline module.
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini API key for the review pipeline.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    logger.info("Gemini API key loaded for review pipeline")
-else:
+if not GEMINI_API_KEY:
     logger.error("GEMINI_API_KEY not set — Gemini review generation is disabled.")
 
 
@@ -139,20 +135,16 @@ def filter_suggestions_by_memory(suggestions: List[Dict[str, Any]], repo_name: s
 def _extract_gemini_token_usage(response: Any) -> int:
     """Extract token usage from Gemini response metadata."""
     try:
-        metadata = getattr(response, "metadata", None) or {}
-        token_usage = None
+        metadata = getattr(response, "usage_metadata", None) or getattr(response, "metadata", None) or {}
         if isinstance(metadata, dict):
-            token_usage = metadata.get("tokenUsage")
-        else:
-            token_usage = getattr(metadata, "tokenUsage", None)
+            return int(metadata.get("totalTokenCount", metadata.get("total", 0)) or 0)
 
-        if token_usage is None:
-            return 0
-
-        if isinstance(token_usage, dict):
-            return int(token_usage.get("total", 0) or 0)
-
-        return int(getattr(token_usage, "total", 0) or 0)
+        return int(
+            getattr(metadata, "total_token_count", None)
+            or getattr(metadata, "totalTokenCount", None)
+            or getattr(metadata, "total", 0)
+            or 0
+        )
     except Exception:
         return 0
 
@@ -172,24 +164,29 @@ def call_gemini_review(prompt: str) -> Dict[str, Any]:
         }
 
     try:
-        response = genai.generate_text(
-            model="gemini-2.5-flash",
-            prompt=prompt,
-            temperature=0.0,
-            max_output_tokens=1500,
-            top_p=0.95,
-            candidate_count=1,
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        chat = client.chats.create(model="gemini-2.5-flash")
+        response = chat.send_message(
+            prompt,
+            config=genai.types.GenerateContentConfig(
+                temperature=0.0,
+                topP=0.95,
+                maxOutputTokens=1500,
+                candidateCount=1,
+            ),
         )
         logger.info("Gemini response received")
 
-        review_text = ""
-        if hasattr(response, "text") and response.text:
-            review_text = response.text
-        elif getattr(response, "candidates", None):
+        review_text = getattr(response, "text", "") or ""
+        if not review_text and getattr(response, "candidates", None):
             first_candidate = response.candidates[0]
             review_text = getattr(first_candidate, "output", "") or ""
-        elif hasattr(response, "last"):
-            review_text = response.last
+        if not review_text and getattr(response, "parts", None):
+            review_text = " ".join(
+                getattr(part, "text", "") or ""
+                for part in response.parts
+                if getattr(part, "text", None)
+            ).strip()
 
         review_text = review_text.strip()
         if not review_text:
