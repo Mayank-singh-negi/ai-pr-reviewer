@@ -6,7 +6,7 @@ This guide explains how to deploy the ai-pr-reviewer to Railway.
 ## Prerequisites
 - A GitHub repository with the ai-pr-reviewer code
 - A Railway account (https://railway.app)
-- Claude API key (https://console.anthropic.com)
+- Google Gemini API key
 - GitHub personal access token
 
 ## Step 1: Deploy to Railway
@@ -31,7 +31,7 @@ railway up
 In the Railway dashboard, go to your project → Variables and add:
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+GEMINI_API_KEY=your_gemini_api_key
 GITHUB_TOKEN=ghp_...
 GITHUB_WEBHOOK_SECRET=your_webhook_secret_here
 ```
@@ -70,7 +70,7 @@ curl https://<your-railway-domain>/health
 - Push a new branch to your repository
 - Open a pull request
 - The webhook will trigger the review pipeline
-- Check the PR comments for Claude's review
+- Check the PR comments for Gemini's review
 
 ## Monitoring
 
@@ -96,9 +96,9 @@ https://<your-railway-domain>/health
 3. Manually test webhook by creating a PR
 4. Verify the webhook delivery in GitHub → Settings → Webhooks → Recent Deliveries
 
-### Claude API Errors
-1. Verify `ANTHROPIC_API_KEY` is valid
-2. Check Claude API usage limits
+### Gemini API Errors
+1. Verify `GEMINI_API_KEY` is valid
+2. Check Google Gemini model availability and rate limits
 3. Review logs for token count and error messages
 
 ### Permission Errors
@@ -116,7 +116,7 @@ Railway automatically creates these directories:
 1. **Database Persistence**: Railway provides persistent storage at `/tmp` — make sure `chroma_db/` is there
 2. **Memory Optimization**: The RAG indexer caches embeddings in ChromaDB
 3. **Rate Limiting**: The service is configured with 1 review per PR to avoid duplicate triggers
-4. **Token Usage**: Monitor Claude API usage via `/stats` endpoint
+4. **Token Usage**: Monitor Gemini token usage via `/stats` endpoint
 
 ## Rollback
 
@@ -129,5 +129,5 @@ To rollback to a previous deployment:
 
 For issues:
 - Check Railway docs: https://docs.railway.app
-- Check Claude API docs: https://docs.anthropic.com
+- Check Google Gemini docs: https://developers.generativeai.google
 - Review GitHub webhook docs: https://docs.github.com/webhooks

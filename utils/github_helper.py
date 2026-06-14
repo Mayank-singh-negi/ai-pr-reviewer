@@ -60,6 +60,24 @@ def fetch_pull_request_diff(pr: PullRequest) -> str:
         raise
 
 
+def post_pr_summary(repo_full_name: str, pr_number: int, body: str) -> dict[str, Any]:
+    """Post a general summary comment on a pull request."""
+    logger.info(f"Posting PR summary for {repo_full_name}#{pr_number}")
+    try:
+        pr = fetch_pull_request(repo_full_name, pr_number)
+        comment = pr.create_issue_comment(body)
+        logger.info(f"PR summary posted: {comment.html_url}")
+        return {
+            "repo_name": repo_full_name,
+            "pr_number": pr_number,
+            "comment_url": getattr(comment, "html_url", None),
+            "comment_id": getattr(comment, "id", None),
+        }
+    except Exception as exc:
+        logger.error(f"Failed to post PR summary for {repo_full_name}#{pr_number}: {exc}")
+        return {"error": str(exc)}
+
+
 def is_valid_signature(secret: str, body: bytes, signature_header: str) -> bool:
     """Validate the GitHub webhook signature using HMAC SHA256."""
     logger.debug("Validating webhook signature")

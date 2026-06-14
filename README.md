@@ -1,6 +1,6 @@
 # AI PR Reviewer
 
-An autonomous GitHub Pull Request reviewer powered by Claude API, MCP, and LangGraph. Automatically reviews every PR for bugs, security vulnerabilities, and performance issues — then posts structured comments directly on GitHub.
+An autonomous GitHub Pull Request reviewer powered by Google Gemini API, MCP, and RAG. Automatically reviews every PR for bugs, security vulnerabilities, and performance issues — then posts structured comments directly on GitHub.
 
 ## Features
 
@@ -15,9 +15,9 @@ An autonomous GitHub Pull Request reviewer powered by Claude API, MCP, and LangG
 
 | Tool | Role |
 |------|------|
-| Claude API | Primary reasoning model for code analysis |
-| MCP (Model Context Protocol) | Custom server connecting Claude to GitHub |
-| LangGraph | Stateful workflow managing the review pipeline |
+| Google Gemini API | Primary reasoning model for code analysis |
+| MCP (Model Context Protocol) | Custom server connecting GitHub to the agent |
+| In-house review pipeline | Stateful workflow managing the review pipeline |
 | ChromaDB | Vector database for RAG over codebase |
 | GitHub API + PyGithub | Read PRs, post comments, manage webhooks |
 | FastAPI | Webhook listener and API service layer |
@@ -30,13 +30,13 @@ GitHub PR Opened
       ↓
 Webhook → FastAPI Listener
       ↓
-LangGraph Pipeline
+Review pipeline
       ↓
 MCP Server → GitHub API (fetch diff)
       ↓
 ChromaDB RAG (codebase context)
       ↓
-Claude API (analyze + generate review)
+Google Gemini API (analyze + generate review)
       ↓
 MCP Server → GitHub API (post comments)
 ```
@@ -47,7 +47,7 @@ MCP Server → GitHub API (post comments)
 
 - Python 3.12+
 - GitHub account
-- Claude API key ([get one here](https://console.anthropic.com))
+- Google Gemini API key
 
 ### Installation
 
@@ -69,7 +69,7 @@ cp .env.example .env
 
 Fill in your `.env`:
 ```
-ANTHROPIC_API_KEY=your_claude_api_key
+GEMINI_API_KEY=your_gemini_api_key
 GITHUB_TOKEN=your_github_token
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
 ```
@@ -92,7 +92,7 @@ ngrok http 8000
 ai-pr-reviewer/
 ├── main.py              # FastAPI webhook listener
 ├── mcp_server/          # Custom MCP server for GitHub
-├── pipeline/            # LangGraph review workflow
+├── pipeline/            # Review workflow and AI integration
 ├── rag/                 # ChromaDB codebase indexing
 ├── requirements.txt
 ├── .env.example
@@ -107,7 +107,7 @@ ai-pr-reviewer/
 
 - [x] Webhook listener
 - [x] MCP server
-- [x] LangGraph pipeline
+- [x] Review pipeline
 - [x] RAG over codebase
 - [ ] Slack notifications
 - [ ] Support for multiple repos

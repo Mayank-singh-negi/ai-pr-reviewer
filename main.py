@@ -9,10 +9,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from dotenv import load_dotenv
 
+from pipeline.review_pipeline import run_review_pipeline
 from utils.github_helper import (
     fetch_pull_request,
     fetch_pull_request_diff,
     is_valid_signature,
+    post_pr_summary,
 )
 from memory.feedback_memory import (
     save_feedback,
@@ -21,6 +23,19 @@ from memory.feedback_memory import (
 
 # Load environment variables from a .env file if present.
 load_dotenv()
+
+# Validate required deployment environment variables.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN is required in the environment.")
+
+WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("GITHUB_WEBHOOK_SECRET is required in the environment.")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required in the environment.")
 
 # Configure logging for the application.
 logging.basicConfig(
@@ -67,10 +82,17 @@ def _ensure_stats_file() -> None:
 
 
 def _load_stats() -> Dict[str, Any]:
-    """Load stats from JSON file."""
+    """Load stats from JSON file and normalize missing fields."""
     _ensure_stats_file()
     with open(STATS_FILE, "r") as f:
-        return json.load(f)
+        stats = json.load(f)
+
+    stats.setdefault("total_prs_reviewed", 0)
+    stats.setdefault("total_comments_posted", 0)
+    stats.setdefault("total_tokens_used", 0)
+    stats.setdefault("created_at", datetime.utcnow().isoformat())
+    stats.setdefault("last_updated", datetime.utcnow().isoformat())
+    return stats
 
 
 def _save_stats(stats: Dict[str, Any]) -> None:
@@ -95,13 +117,19 @@ def _is_rate_limited(repo_name: str, pr_number: int) -> bool:
     return False
 
 
-def _record_pr_review(tokens_used: int = 0) -> None:
+def _record_pr_review(tokens_used: int = 0, comments_posted: int = 0) -> None:
     """Increment PR review stats."""
     stats = _load_stats()
     stats["total_prs_reviewed"] += 1
     stats["total_tokens_used"] += tokens_used
+    stats["total_comments_posted"] += comments_posted
     _save_stats(stats)
-    logger.info(f"Recorded PR review. Total: {stats['total_prs_reviewed']}, Tokens: {stats['total_tokens_used']}")
+    logger.info(
+        "Recorded PR review. Total: %s, Tokens: %s, Comments posted: %s",
+        stats["total_prs_reviewed"],
+        stats["total_tokens_used"],
+        stats["total_comments_posted"],
+    )
 
 
 @app.get("/health", response_class=JSONResponse)
@@ -245,13 +273,37 @@ async def webhook(
     logger.info(f"PR data extracted: title='{pr_title}', diff_lines={len(full_diff.splitlines())}")
     logger.debug(f"PR body: {pr_body[:200] if pr_body else '(empty)'}")
 
-    # Record the review in stats.
-    _record_pr_review(tokens_used=0)
+    # Run the AI review pipeline and post the summary back to GitHub.
+    try:
+        review_result = run_review_pipeline(repo_full_name, pr_number)
+        review_text = review_result.get("review_text", "").strip()
+        tokens_used = int(review_result.get("tokens_used", 0) or 0)
 
-    # TODO: Queue this PR for the review pipeline (Phase 3 integration).
-    logger.info(f"PR {repo_full_name}#{pr_number} queued for review pipeline.")
+        if not review_text:
+            logger.warning("Gemini generated an empty review for %s#%s", repo_full_name, pr_number)
+            raise RuntimeError("Gemini returned an empty review response.")
 
-    return PlainTextResponse("Pull request opened event received and processed.", status_code=200)
+        post_result = post_pr_summary(repo_full_name, pr_number, review_text)
+        if post_result.get("error"):
+            raise RuntimeError(post_result["error"])
+
+        logger.info(
+            "Review comment posted for %s#%s: %s",
+            repo_full_name,
+            pr_number,
+            post_result.get("comment_url"),
+        )
+        _record_pr_review(tokens_used=tokens_used, comments_posted=1)
+    except Exception as exc:
+        logger.error(
+            "Failed to complete AI review for %s#%s: %s",
+            repo_full_name,
+            pr_number,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail=f"AI review failed: {exc}")
+
+    return PlainTextResponse("Pull request review generated and posted.", status_code=200)
 
 
 @app.on_event("startup")

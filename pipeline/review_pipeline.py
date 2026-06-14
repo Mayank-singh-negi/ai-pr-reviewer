@@ -1,10 +1,7 @@
-import re
 import os
 import logging
-import openai
+import google.generativeai as genai
 from typing import Any, Dict, List
-
-from github.GithubException import GithubException
 
 from rag.indexer import index_repository, query_similar_code
 from utils.github_helper import fetch_pull_request, fetch_pull_request_diff
@@ -13,13 +10,13 @@ from memory.feedback_memory import should_skip_suggestion
 # Configure logging for the pipeline module.
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI API key (optional). If not set, the placeholder is used.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-    logger.info("OpenAI API key loaded for review pipeline")
+# Initialize Gemini API key for the review pipeline.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("Gemini API key loaded for review pipeline")
 else:
-    logger.info("OPENAI_API_KEY not set — pipeline will use placeholder reviews")
+    logger.error("GEMINI_API_KEY not set — Gemini review generation is disabled.")
 
 
 def extract_changed_files_from_pr(pr) -> List[Dict[str, str]]:
@@ -100,7 +97,7 @@ def build_review_prompt(
     full_diff: str,
     rag_summary: str,
 ) -> str:
-    """Assemble the review prompt to send to Claude with RAG context included."""
+    """Assemble the review prompt to send to Gemini with RAG context included."""
     logger.debug(f"Building review prompt for {repo_name}#{pr_number}")
     return (
         "You are an expert code reviewer.\n"
@@ -139,42 +136,85 @@ def filter_suggestions_by_memory(suggestions: List[Dict[str, Any]], repo_name: s
     return filtered
 
 
-def call_claude_review(prompt: str) -> str:
-    """Use OpenAI ChatCompletion as the review engine when `OPENAI_API_KEY` is set.
+def _extract_gemini_token_usage(response: Any) -> int:
+    """Extract token usage from Gemini response metadata."""
+    try:
+        metadata = getattr(response, "metadata", None) or {}
+        token_usage = None
+        if isinstance(metadata, dict):
+            token_usage = metadata.get("tokenUsage")
+        else:
+            token_usage = getattr(metadata, "tokenUsage", None)
 
-    This keeps the function name (`call_claude_review`) so the rest of the
-    pipeline does not need to be changed. If `OPENAI_API_KEY` is missing, a
-    readable placeholder string is returned.
-    """
-    logger.info("Invoking review model for prompt (length=%d)", len(prompt))
+        if token_usage is None:
+            return 0
 
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY not configured — returning placeholder review")
-        return (
-            "[OpenAI placeholder review]\n"
-            "OpenAI API key not configured. Set OPENAI_API_KEY to enable real reviews."
-        )
+        if isinstance(token_usage, dict):
+            return int(token_usage.get("total", 0) or 0)
+
+        return int(getattr(token_usage, "total", 0) or 0)
+    except Exception:
+        return 0
+
+
+def call_gemini_review(prompt: str) -> Dict[str, Any]:
+    """Send the assembled review prompt to Gemini and return text plus token usage."""
+    logger.info("Gemini request started (prompt_length=%d)", len(prompt))
+
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY not configured — unable to generate review")
+        return {
+            "review_text": (
+                "[Gemini review error]\n"
+                "GEMINI_API_KEY is required to generate AI reviews."
+            ),
+            "tokens_used": 0,
+        }
 
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert code reviewer."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=1500,
+        response = genai.generate_text(
+            model="gemini-2.5-flash",
+            prompt=prompt,
             temperature=0.0,
+            max_output_tokens=1500,
+            top_p=0.95,
+            candidate_count=1,
         )
-        review_text = response.choices[0].message.content
-        logger.info("OpenAI review received (tokens=%s)", getattr(response, 'usage', {}))
-        return review_text
+        logger.info("Gemini response received")
+
+        review_text = ""
+        if hasattr(response, "text") and response.text:
+            review_text = response.text
+        elif getattr(response, "candidates", None):
+            first_candidate = response.candidates[0]
+            review_text = getattr(first_candidate, "output", "") or ""
+        elif hasattr(response, "last"):
+            review_text = response.last
+
+        review_text = review_text.strip()
+        if not review_text:
+            logger.warning("Gemini returned an empty review response")
+            review_text = (
+                "[Gemini review error]\n"
+                "Gemini returned an empty response. Please verify GEMINI_API_KEY and model access."
+            )
+
+        tokens_used = _extract_gemini_token_usage(response)
+        logger.info("Review generated successfully (tokens_used=%d)", tokens_used)
+        return {"review_text": review_text, "tokens_used": tokens_used}
     except Exception as exc:
-        logger.error(f"OpenAI review call failed: {exc}")
-        return (
-            "[OpenAI review error]\n"
-            f"OpenAI call failed: {exc}\n"
-            "Falling back to placeholder summary."
-        )
+        message = str(exc)
+        if "rate limit" in message.lower() or "429" in message:
+            logger.warning("Gemini rate limit reached: %s", message)
+        logger.error("Review generation failure: %s", exc)
+        return {
+            "review_text": (
+                "[Gemini review failure]\n"
+                f"Gemini API call failed: {exc}\n"
+                "Please verify GEMINI_API_KEY and model access."
+            ),
+            "tokens_used": 0,
+        }
 
 
 def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
@@ -197,8 +237,17 @@ def run_review_pipeline(repo_name: str, pr_number: int) -> Dict[str, Any]:
         rag_summary=rag_summary,
     )
 
-    review_text = call_claude_review(prompt)
+    review_result = call_gemini_review(prompt)
     logger.info(f"Review completed for {repo_name}#{pr_number}")
+
+    return {
+        "repo_name": repo_name,
+        "pr_number": pr_number,
+        "prompt": prompt,
+        "review_text": review_result.get("review_text", ""),
+        "tokens_used": review_result.get("tokens_used", 0),
+        "rag_context": rag_context,
+    }
 
     return {
         "repo_name": repo_name,

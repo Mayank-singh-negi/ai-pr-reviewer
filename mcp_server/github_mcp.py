@@ -1,4 +1,4 @@
-"""MCP server exposing GitHub operations to Claude via stdio transport."""
+"""MCP server exposing GitHub operations to GitHub review agents via stdio transport."""
 
 import os
 import logging
