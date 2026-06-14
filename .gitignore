@@ -1,0 +1,12 @@
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+chroma_db/
+pip_meta/
+.vscode/
+.DS_Store
+*.log
