@@ -50,10 +50,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ai-pr-reviewer", version="1.0.0")
 
-WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("GITHUB_WEBHOOK_SECRET is required in the environment.")
-
 # Paths for stats and memory directories.
 STATS_FILE = os.path.join(os.path.dirname(__file__), "stats.json")
 MEMORY_DIR = os.path.join(os.path.dirname(__file__), "memory")
@@ -143,9 +139,7 @@ async def health() -> Dict[str, Any]:
     logger.info("Health check requested.")
     chroma_status = False
     try:
-        # lazy import to avoid import cycles
         from rag.indexer import is_chroma_available
-
         chroma_status = bool(is_chroma_available())
     except Exception:
         chroma_status = False
@@ -233,19 +227,19 @@ async def webhook(
         logger.debug(f"Event type '{x_github_event}' ignored. Only 'pull_request' events supported.")
         return PlainTextResponse("Event ignored. Only pull_request events are supported.", status_code=200)
 
+    # Parse JSON payload once, with proper error handling.
     try:
         payload = json.loads(payload_bytes.decode("utf-8"))
     except json.JSONDecodeError as exc:
         logger.error(f"Failed to parse JSON payload: {exc}")
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
+    # Accept PR opened, updated, and reopened events.
     action = payload.get("action")
-    if action != "opened":
-        logger.debug(f"PR action '{action}' ignored. Only 'opened' actions are processed.")
-        return PlainTextResponse(
-            f"Pull request event ignored. Action '{action}' is not 'opened'.",
-            status_code=200,
-        )
+    SUPPORTED_ACTIONS = ["opened", "synchronize", "reopened"]
+    if action not in SUPPORTED_ACTIONS:
+        logger.info(f"Ignoring PR action: {action}")
+        return PlainTextResponse(f"PR action '{action}' ignored.", status_code=200)
 
     pull_request_payload = payload.get("pull_request")
     if not pull_request_payload:
@@ -271,7 +265,6 @@ async def webhook(
     # Extract basic PR information from the webhook payload.
     pr_title = pull_request_payload.get("title", "")
     pr_body = pull_request_payload.get("body", "")
-    diff_url = pull_request_payload.get("diff_url", "")
 
     logger.info(f"Processing PR: {repo_full_name}#{pr_number} ({pr_title})")
 
@@ -291,7 +284,12 @@ async def webhook(
     try:
         review_result = run_review_pipeline(repo_full_name, pr_number)
     except Exception as exc:
-        logger.error("RAG or pipeline failure for %s#%s: %s — attempting fallback", repo_full_name, pr_number, exc)
+        logger.error(
+            "RAG or pipeline failure for %s#%s: %s — attempting fallback",
+            repo_full_name,
+            pr_number,
+            exc,
+        )
         # Attempt a fallback Gemini-only review using the diff and minimal context.
         try:
             fallback_prompt = build_review_prompt(
@@ -311,22 +309,23 @@ async def webhook(
     tokens_used = int(review_result.get("tokens_used", 0) or 0)
 
     if not review_text:
-        logger.warning("Final review text empty for %s#%s — posting placeholder", repo_full_name, pr_number)
-        review_text = "[AI review generated no content]"
-
-    post_result = post_pr_summary(repo_full_name, pr_number, review_text)
-    if post_result.get("error"):
-        logger.error("Failed to post review comment for %s#%s: %s", repo_full_name, pr_number, post_result.get("error"))
-    else:
-        logger.info(
-            "Review comment posted for %s#%s: %s",
+        logger.warning(
+            "Final review text empty for %s#%s — posting placeholder",
             repo_full_name,
             pr_number,
-            post_result.get("comment_url"),
         )
-        _record_pr_review(tokens_used=tokens_used, comments_posted=1)
+        review_text = "[AI review unavailable — empty response received]"
 
-    return PlainTextResponse("Pull request review generated and posted.", status_code=200)
+    # Post the review comment to GitHub PR.
+    try:
+        post_pr_summary(repo_full_name, pr_number, review_text)
+        _record_pr_review(tokens_used=tokens_used, comments_posted=1)
+        logger.info(f"Review posted successfully for {repo_full_name}#{pr_number}")
+    except Exception as exc:
+        logger.error(f"Failed to post review for {repo_full_name}#{pr_number}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to post review: {exc}")
+
+    return PlainTextResponse("Review posted successfully.", status_code=200)
 
 
 @app.on_event("startup")
