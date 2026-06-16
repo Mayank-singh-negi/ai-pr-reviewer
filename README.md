@@ -117,3 +117,12 @@ ai-pr-reviewer/
 ## License
 
 MIT
+## Production Status
+
+✅ Live on Railway
+
+Health Endpoint:
+https://web-production-6d8da.up.railway.app/health
+
+Stats Endpoint:
+https://web-production-6d8da.up.railway.app/stats
